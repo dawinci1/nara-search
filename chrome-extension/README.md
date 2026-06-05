@@ -1,4 +1,7 @@
 # NARA NSDAP Trefferbild-Finder
+Chrome-Extension für die NARA-Webseite `catalog.archives.gov`.
+
+Die Extension startet per Klick ein Overlay auf der NARA-Seite und sucht innerhalb der NSDAP-Kartei-Serie nach konkreten Trefferbildern zu einem eingegebenen Suchbegriff. Sie ermittelt nicht nur passende Akten, sondern versucht direkt die betroffenen Bilddateien zu finden und als JPG/IIIF-Link bereitzustellen.
 
 Version: 0.1
 
