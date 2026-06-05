@@ -1,0 +1,1306 @@
+(async () => {
+  /********************************************************************
+   * NARA NSDAP Trefferbild-Finder v0.1
+   *
+   * Nutzung:
+   * 1. https://catalog.archives.gov/ öffnen
+   * 2. F12 → Console
+   * 3. Script einfügen → Enter
+   *
+   * Funktionen:
+   * - Suchbegriff eingeben
+   * - NSDAP-Serie 12044361 durchsuchen
+   * - konkrete Trefferbilder ermitteln
+   * - MFKL/MFOK farblich markieren
+   * - Bild im neuen Tab öffnen
+   * - BG-Link für Mausrad-Klick / Strg-Klick
+   * - geöffnete Zeilen markieren
+   * - einzelnes Bild herunterladen
+   * - alle aktuell angezeigten Bilder herunterladen
+   * - JSON exportieren
+   * - Retry bei NARA 503 / temporären Fehlern
+   ********************************************************************/
+
+  const CONFIG = {
+    ancestorNaId: "12044361",
+    searchLimit: 20,
+    maxPages: 50,
+
+    // NARA ist empfindlich. Nicht zu aggressiv werden.
+    delayMs: 900,
+    detailDelayMs: 1400,
+    downloadDelayMs: 1600,
+
+    // Retry bei 503 etc.
+    retries: 3,
+    retryBaseDelayMs: 2500,
+
+    useJpgViaIiif: true
+  };
+
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+  function log(...args) {
+    console.log("[NARA-NSDAP]", ...args);
+  }
+
+  function warn(...args) {
+    console.warn("[NARA-NSDAP]", ...args);
+  }
+
+  function esc(s) {
+    return String(s ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;");
+  }
+
+  function safeFilename(s) {
+    return String(s ?? "")
+      .replace(/[\\/:*?"<>|]+/g, "_")
+      .replace(/\s+/g, "_")
+      .replace(/_+/g, "_")
+      .slice(0, 180);
+  }
+
+  function extractImageNumber(filename) {
+    const m = String(filename || "").match(/-(\d{3,7})\.(tif|tiff|jpg|jpeg|png)$/i);
+    return m ? String(parseInt(m[1], 10)) : "";
+  }
+
+  function detectKartei(text) {
+    const s = String(text || "");
+    if (s.includes("MFKL")) return "MFKL";
+    if (s.includes("MFOK")) return "MFOK";
+    return "";
+  }
+
+  function buildIiifJpgUrlFromObjectUrl(objectUrl) {
+    if (!objectUrl) return "";
+
+    const marker = "NARAprodstorage/";
+    const idx = objectUrl.indexOf(marker);
+
+    if (idx === -1) return "";
+
+    const path = objectUrl.slice(idx + marker.length);
+    const encodedPath = encodeURIComponent(path).replaceAll("%2F", "%2F");
+
+    return `https://catalog.archives.gov/iiif/3/${encodedPath}/full/max/0/default.jpg`;
+  }
+
+  async function fetchJson(url, options = {}) {
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= CONFIG.retries; attempt++) {
+      try {
+        const res = await fetch(url, {
+          credentials: "include",
+          headers: {
+            "accept": "application/json, text/plain, */*"
+          },
+          ...options
+        });
+
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status} bei ${url}`);
+        }
+
+        return await res.json();
+
+      } catch (e) {
+        lastError = e;
+
+        const isLast = attempt >= CONFIG.retries;
+        if (isLast) break;
+
+        const wait = CONFIG.retryBaseDelayMs * attempt;
+        warn(`Fehler bei Request, Retry ${attempt}/${CONFIG.retries - 1} in ${wait}ms:`, e.message);
+        await sleep(wait);
+      }
+    }
+
+    throw lastError;
+  }
+
+  function deepFindObjects(root, predicate, max = 20000) {
+    const out = [];
+    const seen = new WeakSet();
+
+    function walk(x) {
+      if (!x || out.length >= max) return;
+
+      if (typeof x === "object") {
+        if (seen.has(x)) return;
+        seen.add(x);
+
+        try {
+          if (predicate(x)) out.push(x);
+        } catch (_) {}
+
+        if (Array.isArray(x)) {
+          for (const item of x) walk(item);
+        } else {
+          for (const key of Object.keys(x)) walk(x[key]);
+        }
+      }
+    }
+
+    walk(root);
+    return out;
+  }
+
+  function normalizeNaId(v) {
+    if (v === undefined || v === null) return "";
+    return String(v).trim();
+  }
+
+  function extractSearchRecords(json) {
+    const candidates = deepFindObjects(json, obj => {
+      const blob = JSON.stringify(obj);
+      const naId = normalizeNaId(
+        obj.naId ||
+        obj.naid ||
+        obj.recordNaId ||
+        obj.identifier ||
+        obj.id
+      );
+
+      return (
+        naId &&
+        (
+          blob.includes("A3340-MFKL") ||
+          blob.includes("A3340-MFOK")
+        )
+      );
+    });
+
+    const map = new Map();
+
+    for (const obj of candidates) {
+      const naId = normalizeNaId(
+        obj.naId ||
+        obj.naid ||
+        obj.recordNaId ||
+        obj.identifier ||
+        obj.id
+      );
+
+      if (!naId) continue;
+
+      const title =
+        obj.title ||
+        obj.heading ||
+        obj.description?.title ||
+        obj.description?.itemTitle ||
+        obj.description?.scopeAndContentNote ||
+        "";
+
+      const blob = JSON.stringify(obj);
+      const kartei = detectKartei(blob);
+
+      let displayTitle = String(title || "");
+
+      if (!displayTitle) {
+        const m = blob.match(/A3340-(MFKL|MFOK)[^"\\<>,]*/);
+        displayTitle = m ? m[0] : "";
+      }
+
+      if (!map.has(naId)) {
+        map.set(naId, {
+          naId,
+          title: displayTitle,
+          kartei,
+          raw: obj
+        });
+      }
+    }
+
+    return Array.from(map.values());
+  }
+
+  function extractDigitalObjects(json) {
+    const objects = deepFindObjects(json, obj => {
+      return (
+        obj &&
+        typeof obj === "object" &&
+        (obj.objectId || obj.id) &&
+        (
+          obj.objectFilename ||
+          obj.filename ||
+          obj.objectUrl ||
+          obj.url
+        )
+      );
+    });
+
+    const map = new Map();
+
+    for (const obj of objects) {
+      const objectId = normalizeNaId(obj.objectId || obj.id);
+      if (!objectId) continue;
+
+      const objectFilename = String(obj.objectFilename || obj.filename || "");
+      const objectUrl = String(obj.objectUrl || obj.url || "");
+      const iiifJpgUrl = buildIiifJpgUrlFromObjectUrl(objectUrl);
+
+      map.set(objectId, {
+        objectId,
+        objectFilename,
+        objectUrl,
+        iiifJpgUrl,
+        imageNumber: extractImageNumber(objectFilename),
+        kartei: detectKartei(objectFilename || objectUrl)
+      });
+    }
+
+    return map;
+  }
+
+  async function searchNara(keyword, onProgress) {
+    const allRecords = [];
+    const seen = new Set();
+
+    for (let page = 1; page <= CONFIG.maxPages; page++) {
+      onProgress?.(`Suche Seite ${page} ...`);
+
+      const url =
+        `/proxy/records/search?ancestorNaId=${encodeURIComponent(CONFIG.ancestorNaId)}` +
+        `&controlGroup=*` +
+        `&page=${page}` +
+        `&limit=${CONFIG.searchLimit}` +
+        `&q=${encodeURIComponent(keyword)}` +
+        `&sort=naId:asc` +
+        `&abbreviated=true` +
+        `&debug=true` +
+        `&datesAgg=true`;
+
+      const json = await fetchJson(url);
+      const records = extractSearchRecords(json);
+
+      let newCount = 0;
+
+      for (const rec of records) {
+        if (!seen.has(rec.naId)) {
+          seen.add(rec.naId);
+          allRecords.push(rec);
+          newCount++;
+        }
+      }
+
+      log(`Seite ${page}: ${records.length} Kandidaten, ${newCount} neu`);
+
+      if (records.length === 0 || newCount === 0) {
+        break;
+      }
+
+      await sleep(CONFIG.delayMs);
+    }
+
+    return allRecords;
+  }
+
+  async function getMatchingObjectIds(recordNaId, keyword) {
+    const url =
+      `/proxy/metadata/naid-availability/naid/${encodeURIComponent(recordNaId)}` +
+      `?q=${encodeURIComponent(keyword)}` +
+      `&commentContribution=` +
+      `&extractedTextContribution=` +
+      `&tagContribution=` +
+      `&transcriptionContribution=`;
+
+    const json = await fetchJson(url);
+
+    return Array.isArray(json.ids)
+      ? json.ids.map(String)
+      : [];
+  }
+
+  async function getRecordDigitalObjects(recordNaId) {
+    const url =
+      `/proxy/v3/records/search?naId_is=${encodeURIComponent(recordNaId)}` +
+      `&allowLegacyOrgNames=true` +
+      `&includeExtractedText=true` +
+      `&includeOtherExtractedText=true`;
+
+    const json = await fetchJson(url);
+    return extractDigitalObjects(json);
+  }
+
+  async function collectHits(keyword, onProgress) {
+    const records = await searchNara(keyword, onProgress);
+    const hits = [];
+
+    const failedRecords = [];
+
+    for (let i = 0; i < records.length; i++) {
+      const rec = records[i];
+
+      onProgress?.(`Prüfe Akte ${i + 1}/${records.length}: ${rec.naId}`);
+
+      let matchingIds = [];
+
+      try {
+        matchingIds = await getMatchingObjectIds(rec.naId, keyword);
+      } catch (e) {
+        warn("Konnte Treffer-Bild-IDs nicht laden:", rec.naId, e);
+        failedRecords.push({
+          recordNaId: rec.naId,
+          recordTitle: rec.title,
+          error: e.message
+        });
+        await sleep(CONFIG.detailDelayMs);
+        continue;
+      }
+
+      if (!matchingIds.length) {
+        await sleep(CONFIG.detailDelayMs);
+        continue;
+      }
+
+      let objectMap;
+
+      try {
+        objectMap = await getRecordDigitalObjects(rec.naId);
+      } catch (e) {
+        warn("Konnte Digitalobjekte nicht laden:", rec.naId, e);
+        failedRecords.push({
+          recordNaId: rec.naId,
+          recordTitle: rec.title,
+          error: e.message
+        });
+        await sleep(CONFIG.detailDelayMs);
+        continue;
+      }
+
+      for (const objectId of matchingIds) {
+        const obj = objectMap.get(String(objectId));
+
+        if (!obj) {
+          hits.push({
+            keyword,
+            recordNaId: rec.naId,
+            recordTitle: rec.title,
+            objectId,
+            objectFilename: "",
+            objectUrl: "",
+            iiifJpgUrl: "",
+            imageNumber: "",
+            kartei: rec.kartei || detectKartei(rec.title),
+            missingObjectMapping: true,
+            opened: false,
+            downloaded: false
+          });
+
+          continue;
+        }
+
+        hits.push({
+          keyword,
+          recordNaId: rec.naId,
+          recordTitle: rec.title,
+          objectId,
+          objectFilename: obj.objectFilename,
+          objectUrl: obj.objectUrl,
+          iiifJpgUrl: obj.iiifJpgUrl,
+          imageNumber: obj.imageNumber,
+          kartei: obj.kartei || rec.kartei || detectKartei(rec.title),
+          missingObjectMapping: false,
+          opened: false,
+          downloaded: false
+        });
+      }
+
+      await sleep(CONFIG.detailDelayMs);
+    }
+
+    hits.sort((a, b) => {
+      return String(a.kartei).localeCompare(String(b.kartei)) ||
+             String(a.recordTitle).localeCompare(String(b.recordTitle)) ||
+             Number(a.imageNumber || 0) - Number(b.imageNumber || 0);
+    });
+
+    return { hits, failedRecords };
+  }
+
+  function openInNewTabTryRefocus(url) {
+    if (!url) {
+      alert("Keine Bild-URL vorhanden.");
+      return;
+    }
+
+    const currentWindow = window;
+    const newTab = window.open(url, "_blank");
+
+    try {
+      if (newTab) newTab.blur();
+      currentWindow.focus();
+      window.focus();
+    } catch (e) {}
+
+    setTimeout(() => {
+      try {
+        if (newTab) newTab.blur();
+        currentWindow.focus();
+        window.focus();
+      } catch (e) {}
+    }, 50);
+
+    setTimeout(() => {
+      try {
+        currentWindow.focus();
+        window.focus();
+      } catch (e) {}
+    }, 250);
+  }
+
+  async function copyToClipboard(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    }
+  }
+
+  function makeDownloadFilename(h) {
+    const url = h.iiifJpgUrl || h.objectUrl;
+    const ext = h.iiifJpgUrl ? "jpg" : "tif";
+
+    const imagePart = h.imageNumber ? `Image_${h.imageNumber}` : `Object_${h.objectId}`;
+
+    const base =
+      `${h.keyword}_${h.kartei || "Kartei"}_${h.recordNaId}_${imagePart}_${h.objectFilename || h.objectId}`;
+
+    return safeFilename(base)
+      .replace(/\.(tif|tiff|jpg|jpeg|png)$/i, "") + `.${ext}`;
+  }
+
+  async function downloadUrl(url, filename) {
+    if (!url) {
+      alert("Keine URL vorhanden.");
+      return;
+    }
+
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= CONFIG.retries; attempt++) {
+      try {
+        const res = await fetch(url, {
+          credentials: "include"
+        });
+
+        if (!res.ok) {
+          throw new Error(`Download HTTP ${res.status}`);
+        }
+
+        const blob = await res.blob();
+        const blobUrl = URL.createObjectURL(blob);
+
+        const a = document.createElement("a");
+        a.href = blobUrl;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+
+        setTimeout(() => {
+          URL.revokeObjectURL(blobUrl);
+          a.remove();
+        }, 2000);
+
+        return true;
+
+      } catch (e) {
+        lastError = e;
+
+        const isLast = attempt >= CONFIG.retries;
+        if (isLast) break;
+
+        await sleep(CONFIG.retryBaseDelayMs * attempt);
+      }
+    }
+
+    throw lastError;
+  }
+
+  function createOverlay() {
+    const old = document.getElementById("nara-nsdap-helper");
+    if (old) old.remove();
+
+    const styleOld = document.getElementById("nara-nsdap-helper-style");
+    if (styleOld) styleOld.remove();
+
+    const box = document.createElement("div");
+    box.id = "nara-nsdap-helper";
+
+    box.innerHTML = `
+      <div class="nara-head">
+        <div>
+          <b>NARA NSDAP Trefferbild-Finder</b>
+          <span class="nara-version">v0.1</span>
+        </div>
+        <button id="naraClose" title="Schließen">×</button>
+      </div>
+
+      <div class="nara-controls">
+        <input id="naraKeyword" placeholder="Suchbegriff, z.B. Biernot" />
+        <button id="naraSearch">Suchen</button>
+        <button id="naraDownloadAll" disabled>Download all</button>
+        <button id="naraExport" disabled>JSON exportieren</button>
+      </div>
+
+      <div class="nara-options">
+        <label><input type="checkbox" id="naraOnlyMfkl"> nur MFKL</label>
+        <label><input type="checkbox" id="naraOnlyMfok"> nur MFOK</label>
+        <label><input type="checkbox" id="naraOnlyUnopened"> nur ungeöffnete</label>
+        <label><input type="checkbox" id="naraOnlyNotDownloaded"> nur nicht heruntergeladene</label>
+      </div>
+
+      <div class="nara-hint">
+        Hinweis: Für Öffnen im Hintergrund am zuverlässigsten: <b>Mausrad-Klick</b> oder <b>Strg+Klick</b> auf <b>BG-Link</b>.
+        „Download all“ lädt nur die aktuell angezeigten Treffer nach Filter.
+      </div>
+
+      <div id="naraStatus">Bereit.</div>
+      <div id="naraResults"></div>
+    `;
+
+    const style = document.createElement("style");
+    style.id = "nara-nsdap-helper-style";
+
+    style.textContent = `
+      #nara-nsdap-helper {
+        position: fixed;
+        top: 14px;
+        right: 14px;
+        width: 980px;
+        max-width: calc(100vw - 28px);
+        max-height: calc(100vh - 28px);
+        overflow: auto;
+        background: #111827;
+        color: #f9fafb;
+        z-index: 999999;
+        border: 1px solid #374151;
+        border-radius: 10px;
+        box-shadow: 0 10px 30px rgba(0,0,0,.40);
+        font-family: Arial, sans-serif;
+        font-size: 13px;
+      }
+
+      #nara-nsdap-helper .nara-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 10px 12px;
+        background: #1f2937;
+        border-bottom: 1px solid #374151;
+        position: sticky;
+        top: 0;
+        z-index: 4;
+      }
+
+      #nara-nsdap-helper .nara-version {
+        color: #9ca3af;
+        font-size: 12px;
+        margin-left: 6px;
+      }
+
+      #nara-nsdap-helper #naraClose {
+        background: #374151;
+        color: white;
+        border: 0;
+        border-radius: 6px;
+        padding: 2px 8px;
+        cursor: pointer;
+        font-size: 18px;
+        line-height: 22px;
+      }
+
+      #nara-nsdap-helper .nara-controls,
+      #nara-nsdap-helper .nara-options {
+        display: flex;
+        gap: 8px;
+        padding: 10px 12px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+
+      #nara-nsdap-helper .nara-controls {
+        border-bottom: 1px solid #374151;
+      }
+
+      #nara-nsdap-helper .nara-options {
+        padding-top: 6px;
+        padding-bottom: 6px;
+        color: #d1d5db;
+      }
+
+      #nara-nsdap-helper .nara-hint {
+        padding: 7px 12px;
+        color: #fde68a;
+        background: #451a03;
+        border-top: 1px solid #78350f;
+        border-bottom: 1px solid #78350f;
+      }
+
+      #nara-nsdap-helper input#naraKeyword {
+        flex: 1;
+        min-width: 280px;
+        background: #030712;
+        color: #f9fafb;
+        border: 1px solid #4b5563;
+        border-radius: 6px;
+        padding: 8px;
+      }
+
+      #nara-nsdap-helper button,
+      #nara-nsdap-helper a.nara-link-button {
+        background: #2563eb;
+        color: #fff;
+        border: 0;
+        border-radius: 6px;
+        padding: 8px 10px;
+        cursor: pointer;
+        text-decoration: none;
+        display: inline-block;
+        font-family: Arial, sans-serif;
+        font-size: 13px;
+      }
+
+      #nara-nsdap-helper button:hover,
+      #nara-nsdap-helper a.nara-link-button:hover {
+        filter: brightness(1.15);
+      }
+
+      #nara-nsdap-helper button:disabled {
+        background: #4b5563;
+        cursor: not-allowed;
+        filter: none;
+      }
+
+      #naraDownloadAll {
+        background: #dc2626 !important;
+      }
+
+      #naraDownloadAll:disabled {
+        background: #4b5563 !important;
+      }
+
+      #naraStatus {
+        padding: 8px 12px;
+        color: #d1d5db;
+        border-top: 1px solid #374151;
+        border-bottom: 1px solid #374151;
+        background: #030712;
+      }
+
+      #naraResults {
+        padding: 10px 12px 14px;
+      }
+
+      #naraResults table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      #naraResults th,
+      #naraResults td {
+        border-bottom: 1px solid #374151;
+        padding: 6px;
+        vertical-align: top;
+      }
+
+      #naraResults th {
+        text-align: left;
+        color: #e5e7eb;
+        background: #1f2937;
+        position: sticky;
+        top: 41px;
+        z-index: 3;
+      }
+
+      #naraResults tr:hover {
+        background: #1f2937;
+      }
+
+      #naraResults tr.nara-opened {
+        background: #064e3b !important;
+      }
+
+      #naraResults tr.nara-opened td {
+        border-bottom-color: #10b981;
+      }
+
+      #naraResults tr.nara-downloaded {
+        outline: 1px solid #22c55e;
+      }
+
+      #naraResults tr.nara-opened .naraOpen {
+        background: #059669;
+      }
+
+      #naraResults tr.nara-downloaded .naraDownload {
+        background: #16a34a;
+      }
+
+      .nara-badge {
+        display: inline-block;
+        border-radius: 999px;
+        padding: 2px 8px;
+        font-weight: bold;
+        font-size: 12px;
+        min-width: 42px;
+        text-align: center;
+      }
+
+      .nara-mfkl {
+        background: #7c2d12;
+        color: #ffedd5;
+      }
+
+      .nara-mfok {
+        background: #164e63;
+        color: #cffafe;
+      }
+
+      .nara-unknown {
+        background: #374151;
+        color: #f3f4f6;
+      }
+
+      .nara-small {
+        color: #9ca3af;
+        font-size: 12px;
+        word-break: break-all;
+      }
+
+      .nara-file {
+        word-break: break-all;
+      }
+
+      .nara-row-actions {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+
+      .nara-row-actions button,
+      .nara-row-actions a.nara-link-button {
+        padding: 5px 7px;
+        font-size: 12px;
+      }
+
+      .nara-row-actions .nara-bg-link {
+        background: #4f46e5;
+      }
+
+      .nara-row-actions .nara-bg-link.nara-bg-opened {
+        background: #059669;
+      }
+
+      .nara-row-actions .nara-copy {
+        background: #6b7280;
+      }
+
+      .nara-empty {
+        color: #d1d5db;
+        padding: 10px 0;
+      }
+
+      .nara-summary {
+        margin-bottom: 8px;
+        color: #e5e7eb;
+      }
+
+      .nara-warning {
+        color: #fbbf24;
+      }
+
+      .nara-error-box {
+        margin: 10px 0;
+        padding: 8px;
+        background: #450a0a;
+        border: 1px solid #991b1b;
+        color: #fecaca;
+        border-radius: 6px;
+      }
+    `;
+
+    document.body.appendChild(style);
+    document.body.appendChild(box);
+
+    return box;
+  }
+
+  function getFilteredHits(box, hits) {
+    const onlyMfkl = box.querySelector("#naraOnlyMfkl").checked;
+    const onlyMfok = box.querySelector("#naraOnlyMfok").checked;
+    const onlyUnopened = box.querySelector("#naraOnlyUnopened").checked;
+    const onlyNotDownloaded = box.querySelector("#naraOnlyNotDownloaded").checked;
+
+    let filtered = hits;
+
+    if (onlyMfkl) filtered = filtered.filter(h => h.kartei === "MFKL");
+    if (onlyMfok) filtered = filtered.filter(h => h.kartei === "MFOK");
+    if (onlyUnopened) filtered = filtered.filter(h => !h.opened);
+    if (onlyNotDownloaded) filtered = filtered.filter(h => !h.downloaded);
+
+    return filtered;
+  }
+
+  function markHitOpened(hits, idx, row, btn, link) {
+    const h = hits[idx];
+    if (!h) return;
+
+    h.opened = true;
+
+    if (row) {
+      row.classList.add("nara-opened");
+    }
+
+    if (btn) {
+      btn.textContent = "Geöffnet";
+    }
+
+    if (link) {
+      link.textContent = "Geöffnet";
+      link.classList.add("nara-bg-opened");
+    }
+  }
+
+  function markHitDownloaded(hits, idx, row, btn) {
+    const h = hits[idx];
+    if (!h) return;
+
+    h.downloaded = true;
+
+    if (row) {
+      row.classList.add("nara-downloaded");
+    }
+
+    if (btn) {
+      btn.textContent = "geladen";
+    }
+  }
+
+  function renderResults(box, hits, failedRecords = []) {
+    const resultsEl = box.querySelector("#naraResults");
+    const filtered = getFilteredHits(box, hits);
+
+    const total = hits.length;
+    const opened = hits.filter(h => h.opened).length;
+    const downloaded = hits.filter(h => h.downloaded).length;
+    const mfkl = hits.filter(h => h.kartei === "MFKL").length;
+    const mfok = hits.filter(h => h.kartei === "MFOK").length;
+
+    const failedBox = failedRecords.length
+      ? `
+        <div class="nara-error-box">
+          <b>${failedRecords.length}</b> Akten konnten wegen NARA-Fehlern nicht vollständig geprüft werden.
+          Meist HTTP 503. Später erneut suchen oder mit längeren Pausen arbeiten.
+        </div>
+      `
+      : "";
+
+    if (!filtered.length) {
+      resultsEl.innerHTML = `
+        <div class="nara-summary">
+          Gesamt: <b>${total}</b> |
+          geöffnet: <b>${opened}</b> |
+          heruntergeladen: <b>${downloaded}</b> |
+          MFKL: <b>${mfkl}</b> |
+          MFOK: <b>${mfok}</b>
+        </div>
+        ${failedBox}
+        <div class="nara-empty">Keine Treffer nach aktuellem Filter.</div>
+      `;
+      return;
+    }
+
+    const rows = filtered.map((h) => {
+      const originalIdx = hits.indexOf(h);
+      const badgeClass =
+        h.kartei === "MFKL" ? "nara-mfkl" :
+        h.kartei === "MFOK" ? "nara-mfok" :
+        "nara-unknown";
+
+      const openUrl = h.iiifJpgUrl || h.objectUrl;
+      const imageLabel = h.imageNumber ? `Image ${esc(h.imageNumber)}` : esc(h.objectId);
+      const openedClass = h.opened ? "nara-opened" : "";
+      const downloadedClass = h.downloaded ? "nara-downloaded" : "";
+      const openText = h.opened ? "Geöffnet" : "Öffnen";
+      const downloadText = h.downloaded ? "geladen" : "Download";
+      const bgText = h.opened ? "Geöffnet" : "BG-Link";
+      const bgOpenedClass = h.opened ? "nara-bg-opened" : "";
+
+      const mappingWarning = h.missingObjectMapping
+        ? `<div class="nara-small nara-warning">Bild-ID gefunden, aber Datei-Mapping fehlt.</div>`
+        : "";
+
+      const bgLink = openUrl
+        ? `<a class="nara-link-button nara-bg-link ${bgOpenedClass}" href="${esc(openUrl)}" target="_blank" rel="noopener noreferrer" data-idx="${originalIdx}" title="Am besten mit Mausrad-Klick oder Strg+Klick öffnen">${bgText}</a>`
+        : `<button disabled>BG-Link</button>`;
+
+      return `
+        <tr class="${openedClass} ${downloadedClass}" data-hit-idx="${originalIdx}">
+          <td>
+            <span class="nara-badge ${badgeClass}">${esc(h.kartei || "?")}</span>
+          </td>
+          <td>
+            <div>${esc(h.recordTitle || "")}</div>
+            <div class="nara-small">Akte NAID: ${esc(h.recordNaId)}</div>
+          </td>
+          <td>${imageLabel}</td>
+          <td>
+            <div class="nara-file">${esc(h.objectFilename || "")}</div>
+            <div class="nara-small">Object-ID: ${esc(h.objectId)}</div>
+            ${mappingWarning}
+          </td>
+          <td>
+            <div class="nara-row-actions">
+              <button class="naraOpen" data-idx="${originalIdx}" ${openUrl ? "" : "disabled"}>${openText}</button>
+              ${bgLink}
+              <button class="naraCopy nara-copy" data-idx="${originalIdx}" ${openUrl ? "" : "disabled"}>URL kopieren</button>
+              <button class="naraDownload" data-idx="${originalIdx}" ${openUrl ? "" : "disabled"}>${downloadText}</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    }).join("");
+
+    resultsEl.innerHTML = `
+      <div class="nara-summary">
+        Angezeigt: <b>${filtered.length}</b> |
+        Gesamt: <b>${total}</b> |
+        geöffnet: <b>${opened}</b> |
+        heruntergeladen: <b>${downloaded}</b> |
+        MFKL: <b>${mfkl}</b> |
+        MFOK: <b>${mfok}</b>
+      </div>
+
+      ${failedBox}
+
+      <table>
+        <thead>
+          <tr>
+            <th>Kartei</th>
+            <th>Akte</th>
+            <th>Bild</th>
+            <th>Datei</th>
+            <th>Aktion</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `;
+
+    resultsEl.querySelectorAll(".naraOpen").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const idx = Number(btn.getAttribute("data-idx"));
+        const h = hits[idx];
+
+        if (!h) return;
+
+        const url = h.iiifJpgUrl || h.objectUrl;
+
+        if (!url) {
+          alert("Keine Bild-URL vorhanden.");
+          return;
+        }
+
+        const row = btn.closest("tr");
+        markHitOpened(hits, idx, row, btn, null);
+
+        openInNewTabTryRefocus(url);
+      });
+    });
+
+    resultsEl.querySelectorAll("a.nara-bg-link").forEach(link => {
+      link.addEventListener("click", () => {
+        const idx = Number(link.getAttribute("data-idx"));
+        const row = link.closest("tr");
+
+        markHitOpened(hits, idx, row, null, link);
+      });
+    });
+
+    resultsEl.querySelectorAll(".naraCopy").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const idx = Number(btn.getAttribute("data-idx"));
+        const h = hits[idx];
+
+        if (!h) return;
+
+        const url = h.iiifJpgUrl || h.objectUrl;
+
+        if (!url) {
+          alert("Keine Bild-URL vorhanden.");
+          return;
+        }
+
+        const ok = await copyToClipboard(url);
+
+        if (ok) {
+          btn.textContent = "kopiert";
+          setTimeout(() => {
+            btn.textContent = "URL kopieren";
+          }, 1200);
+        } else {
+          alert("Kopieren fehlgeschlagen.");
+        }
+      });
+    });
+
+    resultsEl.querySelectorAll(".naraDownload").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const idx = Number(btn.getAttribute("data-idx"));
+        const h = hits[idx];
+
+        if (!h) return;
+
+        const url = h.iiifJpgUrl || h.objectUrl;
+        const filename = makeDownloadFilename(h);
+
+        btn.disabled = true;
+        btn.textContent = "lädt...";
+
+        try {
+          await downloadUrl(url, filename);
+          const row = btn.closest("tr");
+          markHitDownloaded(hits, idx, row, btn);
+        } catch (e) {
+          console.error(e);
+          alert("Download fehlgeschlagen: " + e.message);
+          btn.textContent = "Fehler";
+        } finally {
+          setTimeout(() => {
+            btn.disabled = false;
+            if (!h.downloaded) btn.textContent = "Download";
+          }, 1500);
+        }
+      });
+    });
+  }
+
+  function exportJson(keyword, hits, failedRecords = []) {
+    const payload = {
+      createdAt: new Date().toISOString(),
+      source: "catalog.archives.gov",
+      ancestorNaId: CONFIG.ancestorNaId,
+      keyword,
+      count: hits.length,
+      openedCount: hits.filter(h => h.opened).length,
+      downloadedCount: hits.filter(h => h.downloaded).length,
+      failedRecordCount: failedRecords.length,
+      failedRecords,
+      hits
+    };
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json"
+    });
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+
+    a.href = url;
+    a.download = `nara_nsdap_${safeFilename(keyword)}_summary.json`;
+
+    document.body.appendChild(a);
+    a.click();
+
+    setTimeout(() => {
+      URL.revokeObjectURL(url);
+      a.remove();
+    }, 1000);
+  }
+
+  async function downloadAllVisible(box, hits, setStatus, renderAgain, failedRecords) {
+    const filtered = getFilteredHits(box, hits).filter(h => {
+      const url = h.iiifJpgUrl || h.objectUrl;
+      return !!url && !h.downloaded;
+    });
+
+    if (!filtered.length) {
+      alert("Keine herunterladbaren sichtbaren Treffer vorhanden.");
+      return;
+    }
+
+    const ok = confirm(
+      `Es werden ${filtered.length} aktuell sichtbare, noch nicht heruntergeladene Bilder heruntergeladen.\n\n` +
+      `NARA kann bei zu vielen Downloads bremsen. Fortfahren?`
+    );
+
+    if (!ok) return;
+
+    const downloadAllBtn = box.querySelector("#naraDownloadAll");
+    const searchBtn = box.querySelector("#naraSearch");
+
+    downloadAllBtn.disabled = true;
+    searchBtn.disabled = true;
+
+    let success = 0;
+    let failed = 0;
+
+    for (let i = 0; i < filtered.length; i++) {
+      const h = filtered[i];
+      const idx = hits.indexOf(h);
+      const url = h.iiifJpgUrl || h.objectUrl;
+      const filename = makeDownloadFilename(h);
+
+      setStatus(`Download all: ${i + 1}/${filtered.length} – ${filename}`);
+
+      try {
+        await downloadUrl(url, filename);
+        h.downloaded = true;
+        success++;
+      } catch (e) {
+        failed++;
+        warn("Download fehlgeschlagen:", filename, e);
+      }
+
+      renderAgain();
+
+      await sleep(CONFIG.downloadDelayMs);
+    }
+
+    setStatus(`Download all fertig. Erfolgreich: ${success}, Fehler: ${failed}.`);
+    downloadAllBtn.disabled = hits.length === 0;
+    searchBtn.disabled = false;
+
+    renderAgain();
+  }
+
+  const box = createOverlay();
+
+  const statusEl = box.querySelector("#naraStatus");
+  const keywordEl = box.querySelector("#naraKeyword");
+  const searchBtn = box.querySelector("#naraSearch");
+  const exportBtn = box.querySelector("#naraExport");
+  const downloadAllBtn = box.querySelector("#naraDownloadAll");
+  const onlyMfkl = box.querySelector("#naraOnlyMfkl");
+  const onlyMfok = box.querySelector("#naraOnlyMfok");
+  const onlyUnopened = box.querySelector("#naraOnlyUnopened");
+  const onlyNotDownloaded = box.querySelector("#naraOnlyNotDownloaded");
+
+  let currentHits = [];
+  let currentKeyword = "";
+  let currentFailedRecords = [];
+
+  function setStatus(text) {
+    statusEl.textContent = text;
+  }
+
+  function rerender() {
+    renderResults(box, currentHits, currentFailedRecords);
+    exportBtn.disabled = currentHits.length === 0 && currentFailedRecords.length === 0;
+    downloadAllBtn.disabled = currentHits.length === 0;
+  }
+
+  box.querySelector("#naraClose").addEventListener("click", () => {
+    box.remove();
+  });
+
+  onlyMfkl.addEventListener("change", () => {
+    if (onlyMfkl.checked) onlyMfok.checked = false;
+    rerender();
+  });
+
+  onlyMfok.addEventListener("change", () => {
+    if (onlyMfok.checked) onlyMfkl.checked = false;
+    rerender();
+  });
+
+  onlyUnopened.addEventListener("change", () => {
+    rerender();
+  });
+
+  onlyNotDownloaded.addEventListener("change", () => {
+    rerender();
+  });
+
+  exportBtn.addEventListener("click", () => {
+    exportJson(currentKeyword, currentHits, currentFailedRecords);
+  });
+
+  downloadAllBtn.addEventListener("click", async () => {
+    await downloadAllVisible(
+      box,
+      currentHits,
+      setStatus,
+      rerender,
+      currentFailedRecords
+    );
+  });
+
+  searchBtn.addEventListener("click", async () => {
+    const keyword = keywordEl.value.trim();
+
+    if (!keyword) {
+      alert("Bitte Suchbegriff eingeben.");
+      return;
+    }
+
+    currentKeyword = keyword;
+    currentHits = [];
+    currentFailedRecords = [];
+
+    exportBtn.disabled = true;
+    downloadAllBtn.disabled = true;
+    searchBtn.disabled = true;
+
+    box.querySelector("#naraResults").innerHTML = "";
+
+    try {
+      setStatus(`Suche nach „${keyword}“ ...`);
+
+      const result = await collectHits(keyword, setStatus);
+
+      currentHits = result.hits;
+      currentFailedRecords = result.failedRecords;
+
+      setStatus(
+        `Fertig. ${currentHits.length} Trefferbilder gefunden.` +
+        (currentFailedRecords.length ? ` ${currentFailedRecords.length} Akten mit Fehlern.` : "")
+      );
+
+      rerender();
+
+      console.table(currentHits.map(h => ({
+        kartei: h.kartei,
+        recordNaId: h.recordNaId,
+        image: h.imageNumber,
+        file: h.objectFilename,
+        url: h.iiifJpgUrl || h.objectUrl
+      })));
+
+      if (currentFailedRecords.length) {
+        console.warn("[NARA-NSDAP] Fehlgeschlagene Akten:", currentFailedRecords);
+      }
+
+    } catch (e) {
+      console.error(e);
+      setStatus("Fehler: " + e.message);
+      alert("Fehler: " + e.message);
+    } finally {
+      searchBtn.disabled = false;
+      exportBtn.disabled = currentHits.length === 0 && currentFailedRecords.length === 0;
+      downloadAllBtn.disabled = currentHits.length === 0;
+    }
+  });
+
+  keywordEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      searchBtn.click();
+    }
+  });
+
+  setStatus("Bereit. Suchbegriff eingeben und starten.");
+})();
