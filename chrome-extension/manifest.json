@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "NARA NSDAP Trefferbild-Finder",
+  "version": "0.1",
+  "description": "Startet den NARA NSDAP Trefferbild-Finder per Klick auf catalog.archives.gov. - by dawinci",
+  "permissions": [
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://catalog.archives.gov/*"
+  ],
+  "action": {
+    "default_title": "NARA NSDAP Trefferbild-Finder starten"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}
